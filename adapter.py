@@ -8,7 +8,6 @@ import cv2
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import progressbar
-import tqdm
 
 from waymo_open_dataset.utils import range_image_utils
 from waymo_open_dataset.utils import transform_utils
@@ -104,23 +103,20 @@ class Adapter:
         Args:
         return:
         """
-        # bar = progressbar.ProgressBar(maxval=len(self.__file_names)+1,
-        #             widgets= [progressbar.Percentage(), ' ',
-        #             progressbar.Bar(marker='>',left='[',right=']'),' ',
-        #             progressbar.ETA()])
+        bar = progressbar.ProgressBar(maxval=len(self.__file_names)+1,
+                    widgets= [progressbar.Percentage(), ' ',
+                    progressbar.Bar(marker='>',left='[',right=']'),' ',
+                    progressbar.ETA()])
 
         tf.enable_eager_execution()
         file_num = 1
         frame_num = 0
         print("start converting ...")
-        # bar.start()
+        bar.start()
         for file_idx, file_name in enumerate(self.__file_names):
             print('File {}/{}'.format(file_idx, len(self.__file_names)))
             dataset = tf.data.TFRecordDataset(file_name, compression_type='')
-            for data in tqdm.tqdm(dataset):
-                if frame_num<6143:
-                    frame_num += 1
-                    continue
+            for data in dataset:
                 frame = open_dataset.Frame()
                 frame.ParseFromString(bytearray(data.numpy()))
                 if LOCATION_FILTER == True and frame.context.stats.location not in LOCATION_NAME:
@@ -149,9 +145,9 @@ class Adapter:
                 # print("image:{}\ncalib:{}\nlidar:{}\nlabel:{}\n".format(str(s1-e1),str(s2-e2),str(s3-e3),str(s4-e4)))
 
                 frame_num += 1
-            # bar.update(file_num)
+            bar.update(file_num)
             file_num += 1
-        # bar.finish()
+        bar.finish()
         print("\nfinished ...")
 
     def save_image(self, frame, frame_num):
