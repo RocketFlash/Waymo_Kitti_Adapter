@@ -1,4 +1,6 @@
 import os
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"   
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 import math
 # import time
 import numpy as np
@@ -6,6 +8,7 @@ import cv2
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import progressbar
+import tqdm
 
 from waymo_open_dataset.utils import range_image_utils
 from waymo_open_dataset.utils import transform_utils
@@ -13,23 +16,80 @@ from waymo_open_dataset import dataset_pb2 as open_dataset
 
 ############################Config###########################################
 # path to waymo dataset "folder" (all .tfrecord files in that folder will be converted)
-DATA_PATH = '/home/cyrus/Research/Waymo_Kitti_Adapter/waymo_dataset'
+DATA_PATH = '/dataset/waymo/training/'
 # path to save kitti dataset
-KITTI_PATH = '/home/cyrus/Research/Waymo_Kitti_Adapter/kitti_dataset'
+KITTI_PATH = '/dataset/kitti_format/waymo/training/'
 # location filter, use this to convert your preferred location
 LOCATION_FILTER = True
 LOCATION_NAME = ['location_sf']
 # max indexing length
 INDEX_LENGTH = 15
 # as name
-IMAGE_FORMAT = 'jpg'
+IMAGE_FORMAT = 'png'
 # do not change
 LABEL_PATH = KITTI_PATH + '/label_'
 LABEL_ALL_PATH = KITTI_PATH + '/label_all'
 IMAGE_PATH = KITTI_PATH + '/image_'
 CALIB_PATH = KITTI_PATH + '/calib'
-LIDAR_PATH = KITTI_PATH + '/lidar'
+LIDAR_PATH = KITTI_PATH + '/velodyne'
 ###############################################################################
+
+def isclose(x, y, rtol=1.e-5, atol=1.e-8):
+    return abs(x-y) <= atol + rtol * abs(y)
+
+def euler_angles_from_rotation_matrix(R):
+    '''
+    From a paper by Gregory G. Slabaugh (undated),
+    "Computing Euler angles from a rotation matrix
+    '''
+    phi = 0.0
+    if isclose(R[2,0],-1.0):
+        theta = math.pi/2.0
+        psi = math.atan2(R[0,1],R[0,2])
+    elif isclose(R[2,0],1.0):
+        theta = -math.pi/2.0
+        psi = math.atan2(-R[0,1],-R[0,2])
+    else:
+        theta = -math.asin(R[2,0])
+        cos_theta = math.cos(theta)
+        psi = math.atan2(R[2,1]/cos_theta, R[2,2]/cos_theta)
+        phi = math.atan2(R[1,0]/cos_theta, R[0,0]/cos_theta)
+    return psi, theta, phi
+
+def rotx(t):
+    """ 3D Rotation about the x-axis. """
+    c = np.cos(t)
+    s = np.sin(t)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+
+def roty(t):
+    """ Rotation about the y-axis. """
+    c = np.cos(t)
+    s = np.sin(t)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+
+def rotz(t):
+    """ Rotation about the z-axis. """
+    c = np.cos(t)
+    s = np.sin(t)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+def get_box_transformation_matrix(obj_loc, obj_size, ry):
+    """Create a transformation matrix for a given label box pose."""
+
+    tx,ty,tz = obj_loc
+    c = math.cos(ry)
+    s = math.sin(ry)
+
+    sl, sh, sw = obj_size
+
+    return np.array([
+        [ sl*c,-sw*s,  0,tx],
+        [ sl*s, sw*c,  0,ty],
+        [    0,    0, sh,tz],
+        [    0,    0,  0, 1]])
 
 class Adapter:
     def __init__(self):
@@ -44,19 +104,23 @@ class Adapter:
         Args:
         return:
         """
-        bar = progressbar.ProgressBar(maxval=len(self.__file_names)+1,
-                    widgets= [progressbar.Percentage(), ' ',
-                    progressbar.Bar(marker='>',left='[',right=']'),' ',
-                    progressbar.ETA()])
+        # bar = progressbar.ProgressBar(maxval=len(self.__file_names)+1,
+        #             widgets= [progressbar.Percentage(), ' ',
+        #             progressbar.Bar(marker='>',left='[',right=']'),' ',
+        #             progressbar.ETA()])
 
         tf.enable_eager_execution()
         file_num = 1
         frame_num = 0
         print("start converting ...")
-        bar.start()
-        for file_name in self.__file_names:
+        # bar.start()
+        for file_idx, file_name in enumerate(self.__file_names):
+            print('File {}/{}'.format(file_idx, len(self.__file_names)))
             dataset = tf.data.TFRecordDataset(file_name, compression_type='')
-            for data in dataset:
+            for data in tqdm.tqdm(dataset):
+                if frame_num<6143:
+                    frame_num += 1
+                    continue
                 frame = open_dataset.Frame()
                 frame.ParseFromString(bytearray(data.numpy()))
                 if LOCATION_FILTER == True and frame.context.stats.location not in LOCATION_NAME:
@@ -85,9 +149,9 @@ class Adapter:
                 # print("image:{}\ncalib:{}\nlidar:{}\nlabel:{}\n".format(str(s1-e1),str(s2-e2),str(s3-e3),str(s4-e4)))
 
                 frame_num += 1
-            bar.update(file_num)
+            # bar.update(file_num)
             file_num += 1
-        bar.finish()
+        # bar.finish()
         print("\nfinished ...")
 
     def save_image(self, frame, frame_num):
@@ -102,7 +166,7 @@ class Adapter:
             rgb_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             plt.imsave(img_path, rgb_img, format=IMAGE_FORMAT)
 
-    def save_calib(self, frame, frame_num):
+    def save_calib(self, frame, frame_num, kitti_format=True):
         """ parse and save the calibration data
                 :param frame: open dataset frame proto
                 :param frame_num: the current frame number
@@ -117,7 +181,13 @@ class Adapter:
 
         for camera in frame.context.camera_calibrations:
             tmp=np.array(camera.extrinsic.transform).reshape(4,4)
-            tmp=np.linalg.inv(tmp).reshape((16,))
+            tmp=np.linalg.inv(tmp)
+            axes_transformation = np.array([[0,-1,0,0],
+                                            [0,0,-1,0],
+                                            [1,0,0,0],
+                                            [0,0,0,1]])
+            tmp = np.matmul(axes_transformation, tmp)
+            tmp = tmp.reshape((16,))
             Tr_velo_to_cam.append(["%e" % i for i in tmp])
 
         for cam in frame.context.camera_calibrations:
@@ -127,7 +197,8 @@ class Adapter:
             tmp[0,2]=cam.intrinsic[2]
             tmp[1,2]=cam.intrinsic[3]
             tmp[2,2]=1
-            tmp=(tmp @ waymo_cam_RT)
+            if not kitti_format:
+                tmp=(tmp @ waymo_cam_RT)
             tmp=list(tmp.reshape(12))
             tmp = ["%e" % i for i in tmp]
             camera_calib.append(tmp)
@@ -161,7 +232,7 @@ class Adapter:
         pc_path = LIDAR_PATH + '/' + str(frame_num).zfill(INDEX_LENGTH) + '.bin'
         point_cloud.tofile(pc_path)
 
-    def save_label(self, frame, frame_num):
+    def save_label(self, frame, frame_num, kitti_format=True):
         """ parse and save the label data in .txt format
                 :param frame: open dataset frame proto
                 :param frame_num: the current frame number
@@ -178,6 +249,19 @@ class Adapter:
                         label.box.center_x + label.box.length / 2, label.box.center_y + label.box.width / 2]
                 id_to_bbox[label.id] = bbox
                 id_to_name[label.id] = name - 1
+
+        Tr_velo_to_cam = []
+
+        if kitti_format:
+            for camera in frame.context.camera_calibrations:
+                tmp=np.array(camera.extrinsic.transform).reshape(4,4)
+                tmp=np.linalg.inv(tmp)
+                axes_transformation = np.array([[0,-1,0,0],
+                                            [0,0,-1,0],
+                                            [1,0,0,0],
+                                            [0,0,0,1]])
+                tmp = np.matmul(axes_transformation, tmp)
+                Tr_velo_to_cam.append(tmp)
 
         for obj in frame.laser_labels:
 
@@ -203,6 +287,24 @@ class Adapter:
             y = obj.box.center_y
             z = obj.box.center_z
             rotation_y = obj.box.heading
+
+            if kitti_format:
+                z -= height/2
+                
+                transform_box_to_cam = Tr_velo_to_cam[int(name)] @ get_box_transformation_matrix((x, y, z),(length,height,width), rotation_y)
+                pt1 = np.array([-0.5, 0.5, 0 , 1.])
+                pt2 = np.array([0.5, 0.5, 0 , 1.])
+                pt1 = np.matmul(transform_box_to_cam, pt1)
+                pt2 = np.matmul(transform_box_to_cam, pt2)
+                new_ry = math.atan2(pt2[2]-pt1[2],pt2[0]-pt1[0])
+                rotation_y = -new_ry
+
+                new_loc = np.matmul(Tr_velo_to_cam[int(name)], np.array([x,y,z,1]).T)
+                x, y, z = new_loc[:3]
+
+                
+        
+
             beta = math.atan2(x, z)
             alpha = (rotation_y + beta - math.pi / 2) % (2 * math.pi)
 
